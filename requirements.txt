@@ -1,0 +1,9 @@
+Flask
+slack_sdk
+python-dotenv
+openai
+langchain
+langchain-openai
+gunicorn
+requests
+colorama
