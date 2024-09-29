@@ -6,14 +6,14 @@ from dotenv import load_dotenv
 from threading import Thread
 import re
 from datetime import datetime, timedelta
-
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.chat_history import InMemoryChatMessageHistory
 from langchain_core.runnables.history import RunnableWithMessageHistory
+from tavily import TavilyClient
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 
 # Initialize Flask app
@@ -26,14 +26,18 @@ client = WebClient(token=slack_token)
 # Get BOT_USER_ID from environment variables
 BOT_USER_ID = os.getenv('BOT_USER_ID')
 
-# Initialize OpenAI client
+# Initialize OpenAI client (GPT-4o-mini)
 openai_api_key = os.getenv("OPENAI_API_KEY")
 model = ChatOpenAI(model="gpt-4o-mini", openai_api_key=openai_api_key)
+
+# Tavily API Key
+tavily_api_key = os.getenv("TAVILY_API_KEY")
+tavily_client = TavilyClient(api_key=tavily_api_key)
 
 # Create an in-memory chat history store
 store = {}
 last_activity = {}
-SESSION_TIMEOUT = timedelta(minutes=30)  # Set session timeout to 30 minutes
+SESSION_TIMEOUT = timedelta(minutes=30)
 
 def get_session_history(session_id: str):
     current_time = datetime.now()
@@ -44,7 +48,7 @@ def get_session_history(session_id: str):
 
 # Create a prompt template for the chatbot
 prompt = ChatPromptTemplate.from_messages([
-    ("system", "You are a helpful assistant. Answer all questions to the best of your ability. Format your responses using Slack's markdown syntax: *bold* for bold, _italic_ for italic, `code` for code, and use • for bullet points."),
+    ("system", "You are a helpful assistant. Answer all questions to the best of your ability."),
     MessagesPlaceholder(variable_name="messages")
 ])
 
@@ -57,71 +61,113 @@ with_message_history = RunnableWithMessageHistory(
     input_messages_key="messages"
 )
 
-processed_ids = set()
-
 def format_for_slack(text):
-    # Replace ### with *bold* for headers
     text = re.sub(r'###\s*(.*)', r'*\1*', text)
-    
-    # Replace bullet points (assuming they start with '- ')
     text = re.sub(r'^-\s', '• ', text, flags=re.MULTILINE)
-    
-    # Replace **bold** with *bold* for Slack
     text = re.sub(r'\*\*(.*?)\*\*', r'*\1*', text)
-    
-    # Remove any remaining Markdown syntax that Slack doesn't support
     text = re.sub(r'[#_`]', '', text)
-    
     return text
+
+def search_with_tavily(query):
+    try:
+        response = tavily_client.search(query=query)
+        print(response)  # Debug: Print the response structure
+        if 'results' in response and response['results']:
+            return response['results'][:3]  # Get the top 3 results
+        else:
+            return []  # Return an empty list if no results
+    except Exception as e:
+        print(f"Error in Tavily search: {str(e)}")
+        return []
+
+def handle_event(data):
+    event = data["event"]
+
+    if "text" in event and event["type"] == "message" and event.get("subtype") is None:
+        if event.get("user") == BOT_USER_ID:
+            return
+
+        # Handle messages with search-related keywords
+        if any(keyword in event["text"].lower() for keyword in ["recent", "search", "update", "now", "latest", "news", "current"]):
+            search_query = event["text"]
+            search_results = search_with_tavily(search_query)
+
+            # Check if results are available and prepare the response
+            if search_results:
+                documents_text = "\n\n".join([f"Title: {doc['title']}\nURL: {doc['url']}\nContent: {doc['content']}" for doc in search_results])
+                
+                system_message = SystemMessage(content="""
+                You are a helpful assistant tasked with summarizing search results. Follow these steps:
+                1. Carefully read through all the search results provided.
+                2. Identify the key information that directly answers the user's query.
+                3. Summarize this information in a clear, concise manner.
+                4. If there are conflicting pieces of information, mention this and provide context.
+                5. If the search results don't directly answer the query, provide the most relevant information available.
+                6. Always cite your sources by mentioning the title of the article you're referencing.
+                7. If you're unsure about any information, express that uncertainty.
+                8. Aim for a summary of 3-5 sentences, unless more detail is necessary to properly answer the query.
+                """)
+
+                human_message = HumanMessage(content=f"User Query: {search_query}\n\nSearch Results:\n{documents_text}\n\nPlease summarize these search results to answer the user's query.")
+
+                try:
+                    response_text = ""
+                    for r in with_message_history.stream(
+                        {"messages": [system_message, human_message]},
+                        config={"configurable": {"session_id": f"{event['channel']}_{event['user']}_{datetime.now().strftime('%Y%m%d%H%M')}"}}
+                    ):
+                        response_text += r.content
+
+                    if not response_text.strip():
+                        raise ValueError("Empty response from the model")
+
+                    formatted_response = format_for_slack(response_text)
+
+                    client.chat_postMessage(
+                        channel=event["channel"],
+                        text=formatted_response,
+                        mrkdwn=True
+                    )
+                except Exception as e:
+                    print(f"Error in processing model response: {str(e)}")
+                    client.chat_postMessage(
+                        channel=event["channel"],
+                        text="I apologize, but I encountered an error while processing the search results. Could you please try asking your question again?",
+                        mrkdwn=True
+                    )
+            else:
+                client.chat_postMessage(
+                    channel=event["channel"],
+                    text="I'm sorry, but I couldn't find any relevant information for your query. Could you please try rephrasing your question or providing more context?",
+                    mrkdwn=True
+                )
+            return
+
+        # Process general conversation
+        current_time = datetime.now().strftime("%Y%m%d%H%M")
+        session_id = f"{event['channel']}_{event['user']}_{current_time}"
+        
+        try:
+            response_text = ""
+            for r in with_message_history.stream(
+                {"messages": [HumanMessage(content=event["text"])]},
+                config={"configurable": {"session_id": session_id}}
+            ):
+                response_text += r.content
+
+            formatted_response = format_for_slack(response_text)
+
+            client.chat_postMessage(
+                channel=event["channel"],
+                text=formatted_response,
+                mrkdwn=True
+            )
+        except SlackApiError as e:
+            print(f"Error posting message: {e.response['error']}")
 
 def handle_event_async(data):
     thread = Thread(target=handle_event, args=(data,), daemon=True)
     thread.start()
-
-def handle_event(data):
-    event = data["event"]
-    
-    if "text" in event and event["type"] == "message" and event.get("subtype") is None:
-        # Ignore messages from the bot itself
-        if event.get("user") == BOT_USER_ID:
-            return
-
-        # Handle direct message or app mention
-        if event["channel"].startswith('D') or event.get("channel_type") == 'im' or event["type"] == "app_mention":
-            current_time = datetime.now().strftime("%Y%m%d%H%M")
-            session_id = f"{event['channel']}_{event['user']}_{current_time}"
-            
-            # Print the user's message to the console
-            print(f"User ({event['user']} in {event['channel']}): {event['text']}")
-            print(f"Session ID: {session_id}")
-            
-            try:
-                # Stream response from the model
-                response_text = ""
-                for r in with_message_history.stream(
-                    {"messages": [HumanMessage(content=event["text"])]},
-                    config={"configurable": {"session_id": session_id}}
-                ):
-                    response_text += r.content
-
-                # Format the response for Slack
-                formatted_response = format_for_slack(response_text)
-
-                # Print the bot's response to the console
-                print(f"Bot (before formatting): {response_text}")
-                print(f"Bot (after formatting): {formatted_response}")
-
-                # Send the formatted response back to Slack
-                response = client.chat_postMessage(
-                    channel=event["channel"],
-                    text=formatted_response,
-                    mrkdwn=True
-                )
-                
-                if event["type"] == "app_mention":
-                    processed_ids.add(event.get("client_msg_id"))
-            except SlackApiError as e:
-                print(f"Error posting message: {e.response['error']}")
 
 @app.route('/gpt4mini', methods=['GET'])
 def helloworld():
